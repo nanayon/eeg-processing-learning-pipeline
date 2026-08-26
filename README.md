@@ -126,10 +126,7 @@ s06_eeglab_artifact_preprocessing;
 
 随数据包提供的 `README.txt` 说明 DREAM 数据通常采用 CC BY 4.0，除非实验说明另有规定；实际使用时必须同时阅读并遵守数据包中的 `README.txt`、`ExperimentalDescription.txt`、官方数据页面及其最新条款。`data/README.md` 只提供获取和放置数据的简要说明，不替代原始协议。
 
-## 论文与外部学习来源
-
-以下内容是外部学习材料，不是我的论文，也不是本仓库的研究来源；本项目不声称复现这些论文的研究结论：
-
+## REFs
 1. Konkoly et al. (2021), *Real-time dialogue between experimenters and dreamers during REM sleep*, Current Biology. [DOI](https://doi.org/10.1016/j.cub.2021.01.026)
 2. Wong et al. (2025), *A dream EEG and mentation database*, Nature Communications. [DOI](https://doi.org/10.1038/s41467-025-61945-1)
 3. Delorme & Makeig (2004), *EEGLAB: an open source toolbox for analysis of single-trial EEG dynamics*, Journal of Neuroscience Methods. [DOI](https://doi.org/10.1016/j.jneumeth.2003.10.009)
