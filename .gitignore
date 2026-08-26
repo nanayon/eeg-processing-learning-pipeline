@@ -1,0 +1,50 @@
+# 本地数据与数据衍生物：不上传
+raw/
+results/
+figures/
+logs/
+data/*
+!data/README.md
+
+# MATLAB/EEGLAB 项目生成或临时文件
+resources/
+report/generated/
+*.asv
+*.m~
+*.autosave
+*.bak
+*.tmp
+
+# 常见 EEG/生理信号数据格式
+*.edf
+*.bdf
+*.set
+*.fdt
+*.cnt
+*.vhdr
+*.vmrk
+*.eeg
+*.xdf
+*.rec
+*.poly5
+
+# 结果、元数据及 MATLAB 二进制文件
+*.csv
+*.tsv
+*.mat
+*.fig
+*.h5
+*.hdf5
+*.parquet
+*.zip
+*.7z
+
+# 本地配置、凭据与系统文件
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+.DS_Store
+Thumbs.db
+desktop.ini
