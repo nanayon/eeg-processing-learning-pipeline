@@ -4,21 +4,31 @@ function s06_eeglab_artifact_preprocessing()
 %
 % 本文件是一个独立的学习型处理脚本：
 %   1) 导入连续 EDF，不立即 epoch；
-%   2) 在连续数据上检测高振幅、突变、平坦片段；
-%   3) 用连续数据拟合 ICA，并用 EOG/EMG 相关性提出候选 IC；
-%   4) 人工复核后，从完整连续数据中移除指定 IC；
-%   5) 在清洗后的连续数据上分别滤波 EEG/EOG/EMG；
-%   6) 最后才截取最后一个 code 32 的 epoch；
-%   7) 保存中间结果、评分表、伪迹区间和质控图。
+%   2) 在连续数据上生成自动伪迹候选（只作参考）；
+%   3) 打开连续波形，人工标注需要删除的时间片段；
+%   4) 删除人工确认的连续伪迹；需要时再用剩余连续数据拟合 ICA；
+%   5) 需要 ICA 时人工复核成分并移除眼动/肌电等成分；
+%   6) 在清洗后的连续数据上分别滤波 EEG/EOG/EMG；
+%   7) 最后才截取最后一个 code 32 的 epoch；
+%   8) 保存中间结果、评分表、伪迹区间和质控图。
 %
 % 重要：
 %   - TWC_USA 发布包已经对多数坏 EEG 通道做过球面插值。本文件不会重复
 %     插值，并会在 ICA 拟合时排除这些已插值通道。
-%   - EOG/EMG 相关性只用来提出候选 IC，不能代替人工判断。
+%   - 自动阈值和 EOG/EMG 相关性只用来提出候选，不能代替人工判断。
 %   - 第一次运行建议只处理 case07_sub106，并保留默认的人工复核模式。
 
 %% 0. 学习参数：先从这里读懂并修改
 caseName = 'case07_sub106';
+
+% 连续伪迹处理：人工标注为主。
+manualContinuousReview = true;
+showAutomaticIntervalsInReview = false;
+deleteMarkedContinuousArtifacts = true;
+manualReviewWindowSeconds = 30;
+
+% ICA 是可选的第二阶段。先掌握人工连续伪迹删除，再改为 true 学习 ICA。
+enableICA = false;
 
 % ICA 成分复核：
 %   true  -> 有候选 IC 时在命令窗口询问要删除哪些成分；
@@ -57,7 +67,7 @@ icaMaxSteps = 512;
 referenceEvent = '32';
 epochWindow = [-10 10];
 
-% 默认只把伪迹 epoch 写入日志，不自动删除，便于学习和复核。
+% epoch 级残余伪迹默认只写入日志，不自动删除；连续标记按上面的配置删除。
 rejectDetectedEpoch = false;
 epochPeakToPeakThresholdUV = 500;
 
@@ -83,8 +93,9 @@ addpath(eeglabRoot);
 addpath(codeDir);
 eeglab('nogui');
 
-requiredFunctions = {'pop_biosig','pop_eegfiltnew','pop_runica', ...
-    'pop_subcomp','eeg_eegrej','pop_epoch','pop_rejepoch','pop_saveset'};
+requiredFunctions = {'pop_biosig','pop_eegfiltnew','eeg_eegrej', ...
+    'eegplot','pop_epoch','pop_rejepoch','pop_saveset', ...
+    'pop_runica','pop_subcomp'};
 for k = 1:numel(requiredFunctions)
     if isempty(which(requiredFunctions{k}))
         error('找不到 EEGLAB 函数：%s。请检查插件和 MATLAB 路径。', ...
@@ -99,6 +110,11 @@ end
 
 cfg = struct();
 cfg.caseName = caseName;
+cfg.manualContinuousReview = manualContinuousReview;
+cfg.showAutomaticIntervalsInReview = showAutomaticIntervalsInReview;
+cfg.deleteMarkedContinuousArtifacts = deleteMarkedContinuousArtifacts;
+cfg.manualReviewWindowSeconds = manualReviewWindowSeconds;
+cfg.runICA = enableICA;
 cfg.reviewComponents = reviewComponents;
 cfg.componentsToRemove = componentsToRemove;
 cfg.autoRemoveSuggestedComponents = autoRemoveSuggestedComponents;
@@ -122,18 +138,7 @@ cfg.epochWindow = epochWindow;
 cfg.rejectDetectedEpoch = rejectDetectedEpoch;
 cfg.epochPeakToPeakThresholdUV = epochPeakToPeakThresholdUV;
 
-fprintf('\n========================================\n');
-fprintf('TWC_USA 连续伪迹处理学习脚本\n');
-fprintf('案例：%s\n', caseName);
-fprintf('原始文件不会被覆盖。\n');
-fprintf('========================================\n\n');
-
 processOneCase(edfFile, outputDir, figureDir, cfg);
-
-fprintf('\n========================================\n');
-fprintf('处理完成。\n');
-fprintf('输出目录：%s\n', outputDir);
-fprintf('========================================\n');
 
 end
 
@@ -144,7 +149,6 @@ caseName = cfg.caseName;
 
 %% A. 导入连续 EDF
 % 这里故意不调用 pop_epoch：先保留完整连续记录，方便检测连续伪迹并拟合 ICA。
-fprintf('A. 导入连续 EDF，不进行 epoch ...\n');
 EEG_raw = pop_biosig(edfFile, ...
     'importevent', 'on', ...
     'importannot', 'on', ...
@@ -169,167 +173,152 @@ if numel(icaEegIdx) < 2
     error('%s：排除已插值通道后，ICA 可用 EEG 少于 2 个。', caseName);
 end
 
-fprintf('   采样率：%.1f Hz；时长：%.2f s；通道数：%d；事件数：%d\n', ...
-    EEG_raw.srate, EEG_raw.pnts / EEG_raw.srate, ...
-    EEG_raw.nbchan, numel(EEG_raw.event));
-fprintf('   EEG：%s\n', strjoin(labels(eegIdx), ', '));
-fprintf('   EOG：%s\n', joinOrNone(labels(eogIdx)));
-fprintf('   EMG：%s\n', joinOrNone(labels(emgIdx)));
-fprintf('   Status 索引：%s\n', mat2str(statusIdx));
-fprintf('   已插值、从 ICA 排除：%s\n', joinOrNone(knownInterpolatedLabels));
-fprintf('   ICA 使用 EEG 数量：%d\n', numel(icaEegIdx));
-
 %% B. 检查 EDF 转换造成的末尾平坦 EEG
 % DREAM 说明只说“可能”有约 1 秒平坦尾部，所以只在实际检测到时记录。
-fprintf('B. 检查末尾平坦 EEG ...\n');
 flatTail = detectFlatTail(EEG_raw, eegIdx, 1.0, cfg.flatThresholdUV);
-if flatTail.detected
-    fprintf('   检测到末尾 %.3f s 平坦 EEG。\n', flatTail.durationSeconds);
-else
-    fprintf('   未检测到满足阈值的平坦尾部。\n');
-end
 
 %% C. 在连续 EEG 上检测高振幅、突变和平坦片段
-% 这一步只生成“需要复核/拒绝”的区间，不直接修改原始数据。
-fprintf('C. 连续伪迹检测 ...\n');
+% 这一步只生成自动候选；最终是否删除由连续波形人工复核决定。
 EEG_detection = pop_eegfiltnew(EEG_raw, ...
-    'locutoff', 0.5, 'hicutoff', 35, 'channels', icaEegIdx);
+    'locutoff', 0.5, 'hicutoff', 35, 'channels', eegIdx);
 detectionDataUV = double(EEG_detection.data(icaEegIdx, :, 1));
 
 [badMask, detectionSummary] = detectContinuousArtifacts( ...
     detectionDataUV, EEG_raw.srate, cfg);
 
-badIntervals = maskToIntervals(badMask, EEG_raw.srate, ...
+autoBadIntervals = maskToIntervals(badMask, EEG_raw.srate, ...
     cfg.minimumBadDurationSeconds, cfg.artifactPadSeconds, EEG_raw.pnts);
 
 if flatTail.detected
     tailStart = EEG_raw.pnts - flatTail.samples + 1;
     tailEnd = EEG_raw.pnts;
-    badIntervals = mergeIntervals([badIntervals; tailStart tailEnd], EEG_raw.pnts);
+    autoBadIntervals = mergeIntervals( ...
+        [autoBadIntervals; tailStart tailEnd], EEG_raw.pnts);
+end
+
+[~, originalTargetLatency] = keepLatestReferenceEvent( ...
+    EEG_raw, cfg.referenceEvent);
+
+% 自动区间在界面中默认不预先标色；这样“删除什么”由人工观察决定。
+% 如希望把自动候选作为起点，可将 showAutomaticIntervalsInReview 改为 true。
+if cfg.manualContinuousReview
+    [badIntervals, manualReviewAccepted] = manuallyReviewContinuousArtifacts( ...
+        EEG_detection, eegIdx, autoBadIntervals, cfg);
+else
+    badIntervals = autoBadIntervals;
+    manualReviewAccepted = false;
 end
 
 recordSeconds = EEG_raw.pnts / EEG_raw.srate;
 badSeconds = intervalDurationSeconds(badIntervals, EEG_raw.srate);
 badFraction = badSeconds / recordSeconds;
 
-fprintf('   高振幅样本：%.2f s\n', detectionSummary.peakSeconds);
-fprintf('   突变样本：%.2f s\n', detectionSummary.jumpSeconds);
-fprintf('   平坦窗口：%.2f s\n', detectionSummary.flatSeconds);
-fprintf('   合并后区间：%d 个，共 %.2f s（%.2f%%）\n', ...
-    size(badIntervals, 1), badSeconds, 100 * badFraction);
-
-% 如果自动检测覆盖太多记录，避免把大部分样本都拿去训练 ICA。
-% 但确定的平坦尾部仍可以单独排除。
-if badFraction <= cfg.maxICARejectFraction
-    intervalsForICA = badIntervals;
-elseif flatTail.detected
-    intervalsForICA = [EEG_raw.pnts - flatTail.samples + 1, EEG_raw.pnts];
-    warning('%s：检测区间超过 %.0f%%，ICA 只排除平坦尾部。', ...
-        caseName, 100 * cfg.maxICARejectFraction);
-else
-    intervalsForICA = zeros(0, 2);
-    warning('%s：检测区间超过 %.0f%%，ICA 不自动删除检测区间。', ...
-        caseName, 100 * cfg.maxICARejectFraction);
+% 人工确认的区间会同时用于 ICA 训练和最终连续数据删除。
+intervalsForICA = badIntervals;
+if cfg.runICA && badFraction > cfg.maxICARejectFraction
+    warning('%s：人工标记区间占 %.2f%%，超过 ICA 建议上限 %.0f%%；请复核标记。', ...
+        caseName, 100 * badFraction, 100 * cfg.maxICARejectFraction);
 end
 
-%% D. 在连续数据上拟合 ICA
-% ICA 使用 1-40 Hz 副本；最终 EEG 仍会使用 0.5-35 Hz 副本。
-fprintf('D. 在连续数据上拟合 ICA（%.1f-%.1f Hz） ...\n', ...
-    cfg.icaBand(1), cfg.icaBand(2));
-
-icaFilterChannels = unique([icaEegIdx, eogIdx, emgIdx]);
-EEG_ica = pop_eegfiltnew(EEG_raw, ...
-    'locutoff', cfg.icaBand(1), ...
-    'hicutoff', cfg.icaBand(2), ...
-    'channels', icaFilterChannels);
-
-if ~isempty(intervalsForICA)
-    fprintf('   从 ICA 训练副本排除 %.2f s 区间。\n', ...
-        intervalDurationSeconds(intervalsForICA, EEG_raw.srate));
-    EEG_ica = eeg_eegrej(EEG_ica, intervalsForICA);
-end
-
-% 只用未插值的 EEG 通道估计独立成分；EOG/EMG 留在结构中作为参考信号。
-EEG_ica = pop_runica(EEG_ica, ...
-    'icatype', 'runica', ...
-    'chanind', icaEegIdx, ...
-    'options', {'extended', 1, ...
-    'verbose', 'off', ...
-    'interrupt', 'off', ...
-    'maxsteps', cfg.icaMaxSteps});
-EEG_ica = eeg_checkset(EEG_ica);
-
-icaActivity = calculateICAActivity(EEG_ica);
 referenceIndices = [eogIdx, emgIdx];
 referenceLabels = labels(referenceIndices);
-componentScores = zeros(size(icaActivity, 1), numel(referenceIndices));
+componentScores = zeros(0, numel(referenceIndices));
+suggestedComponents = zeros(1, 0);
+removedComponents = zeros(1, 0);
+componentCsv = '';
 
-for ic = 1:size(icaActivity, 1)
-    for r = 1:numel(referenceIndices)
-        referenceSignal = double(EEG_ica.data(referenceIndices(r), :, 1));
-        componentScores(ic, r) = abs(safeCorrelation( ...
-            icaActivity(ic, :), referenceSignal));
+%% D. 可选：在删除连续伪迹后拟合 ICA
+% enableICA=false 时，流程到这里不会运行 ICA；先学习人工波形标注和删除。
+if cfg.runICA
+    % ICA 使用 1-40 Hz 副本；最终 EEG 仍会使用 0.5-35 Hz 副本。
+    icaFilterChannels = unique([icaEegIdx, eogIdx, emgIdx]);
+    EEG_ica = pop_eegfiltnew(EEG_raw, ...
+        'locutoff', cfg.icaBand(1), ...
+        'hicutoff', cfg.icaBand(2), ...
+        'channels', icaFilterChannels);
+
+    if ~isempty(intervalsForICA)
+        EEG_ica = eeg_eegrej(EEG_ica, intervalsForICA);
     end
-end
 
-if isempty(referenceIndices)
-    suggestedComponents = zeros(1, 0);
-else
-    suggestedComponents = find(max(componentScores, [], 2) >= ...
-        cfg.componentCorrelationThreshold)';
-end
+    % 只用未插值的 EEG 通道估计独立成分；EOG/EMG 留在结构中作参考信号。
+    EEG_ica = pop_runica(EEG_ica, ...
+        'icatype', 'runica', ...
+        'chanind', icaEegIdx, ...
+        'options', {'extended', 1, ...
+        'verbose', 'off', ...
+        'interrupt', 'off', ...
+        'maxsteps', cfg.icaMaxSteps});
+    EEG_ica = eeg_checkset(EEG_ica);
 
-componentTable = makeComponentTable(componentScores, referenceLabels, ...
-    cfg.componentCorrelationThreshold, suggestedComponents);
-componentCsv = fullfile(outputDir, [caseName, '_component_scores.csv']);
-writetable(componentTable, componentCsv);
+    icaActivity = calculateICAActivity(EEG_ica);
+    componentScores = zeros(size(icaActivity, 1), numel(referenceIndices));
+    for ic = 1:size(icaActivity, 1)
+        for r = 1:numel(referenceIndices)
+            referenceSignal = double(EEG_ica.data(referenceIndices(r), :, 1));
+            componentScores(ic, r) = abs(safeCorrelation( ...
+                icaActivity(ic, :), referenceSignal));
+        end
+    end
 
-fprintf('   ICA 成分数：%d\n', size(icaActivity, 1));
-fprintf('   EOG/EMG 相关性候选 IC：%s\n', mat2str(suggestedComponents));
-fprintf('   成分评分表：%s\n', componentCsv);
-
-%% E. 选择要移除的 IC
-% 相关性是候选机制，不是最终判据。第一次学习时建议查看 CSV 后再输入。
-if ~isempty(cfg.componentsToRemove)
-    removedComponents = unique(cfg.componentsToRemove(:)');
-elseif cfg.autoRemoveSuggestedComponents
-    removedComponents = suggestedComponents;
-elseif cfg.reviewComponents && ~isempty(suggestedComponents)
-    fprintf('\n候选 IC：%s\n', mat2str(suggestedComponents));
-    fprintf('请输入要移除的 EEGLAB IC 编号；直接回车表示暂不移除。\n');
-    answer = input('IC 编号，例如 [1 4]： ');
-    if isempty(answer)
-        removedComponents = zeros(1, 0);
+    if isempty(referenceIndices)
+        suggestedComponents = zeros(1, 0);
     else
-        removedComponents = unique(answer(:)');
+        suggestedComponents = find(max(componentScores, [], 2) >= ...
+            cfg.componentCorrelationThreshold)';
+    end
+
+    componentTable = makeComponentTable(componentScores, referenceLabels, ...
+        cfg.componentCorrelationThreshold, suggestedComponents);
+    componentCsv = fullfile(outputDir, [caseName, '_component_scores.csv']);
+    writetable(componentTable, componentCsv);
+
+    %% E. 选择要移除的 IC
+    % 相关性是候选机制，不是最终判据。应结合 IC 图形/波形后再输入。
+    if ~isempty(cfg.componentsToRemove)
+        removedComponents = unique(cfg.componentsToRemove(:)');
+    elseif cfg.autoRemoveSuggestedComponents
+        removedComponents = suggestedComponents;
+    elseif cfg.reviewComponents && ~isempty(suggestedComponents)
+        fprintf('\n候选 IC：%s\n', mat2str(suggestedComponents));
+        fprintf('请结合 ICA 成分图形后输入要移除的 IC；直接回车表示暂不移除。\n');
+        answer = input('IC 编号，例如 [1 4]： ');
+        if isempty(answer)
+            removedComponents = zeros(1, 0);
+        else
+            removedComponents = unique(answer(:)');
+        end
+    end
+
+    nComponents = size(icaActivity, 1);
+    if any(removedComponents < 1 | removedComponents > nComponents | ...
+            removedComponents ~= round(removedComponents))
+        error('%s：要移除的 IC 编号无效。', caseName);
+    end
+end
+
+%% F. 应用可选 ICA，并删除人工确认的时间片段
+% 如果 deleteMarkedContinuousArtifacts=true，人工标记片段会从工作数据中删除；
+% eeg_eegrej 会同步更新事件 latency，并保留 boundary 事件。
+EEG_cleanBase = EEG_raw;
+continuousIntervalsDeleted = cfg.deleteMarkedContinuousArtifacts && ...
+    ~isempty(badIntervals);
+if continuousIntervalsDeleted
+    EEG_cleanBase = eeg_eegrej(EEG_cleanBase, badIntervals);
+    EEG_cleanBase = eeg_checkset(EEG_cleanBase);
+end
+
+if cfg.runICA
+    EEG_clean = copyICAFields(EEG_cleanBase, EEG_ica, icaEegIdx);
+    if ~isempty(removedComponents)
+        EEG_clean = pop_subcomp(EEG_clean, removedComponents, 0);
     end
 else
-    removedComponents = zeros(1, 0);
-end
-
-nComponents = size(icaActivity, 1);
-if any(removedComponents < 1 | removedComponents > nComponents | ...
-        removedComponents ~= round(removedComponents))
-    error('%s：要移除的 IC 编号无效。', caseName);
-end
-fprintf('   本次移除 IC：%s\n', mat2str(removedComponents));
-
-%% F. 将 ICA 应用到完整连续数据
-% ICA 训练副本为了排除污染段而改变了长度；这里把 ICA 矩阵应用回完整数据，
-% 因此原始事件 latency 保持不变。污染段仍由 badIntervals 在后面用于 epoch 质控。
-fprintf('F. 将 ICA 应用到完整连续数据 ...\n');
-EEG_clean = copyICAFields(EEG_raw, EEG_ica, icaEegIdx);
-if ~isempty(removedComponents)
-    EEG_clean = pop_subcomp(EEG_clean, removedComponents, 0);
+    EEG_clean = EEG_cleanBase;
 end
 EEG_clean = eeg_checkset(EEG_clean);
 
 %% G. 清洗后再建立 EEG/EOG/EMG 滤波副本
-fprintf('G. 清洗后连续滤波：EEG %.1f-%.1f Hz；EOG %.1f-%.1f Hz；EMG %.1f-%.1f Hz\n', ...
-    cfg.eegBand(1), cfg.eegBand(2), ...
-    cfg.eogBand(1), cfg.eogBand(2), ...
-    cfg.emgBand(1), cfg.emgBand(2));
-
 EEG_eegContinuous = pop_eegfiltnew(EEG_clean, ...
     'locutoff', cfg.eegBand(1), ...
     'hicutoff', cfg.eegBand(2), ...
@@ -361,17 +350,30 @@ artifactInfo.eogBandHz = cfg.eogBand;
 artifactInfo.emgBandHz = cfg.emgBand;
 artifactInfo.removedComponents = removedComponents;
 artifactInfo.suggestedComponents = suggestedComponents;
+artifactInfo.componentScoresFile = componentCsv;
+artifactInfo.automaticBadIntervalsSamples = autoBadIntervals;
+artifactInfo.manualReviewAccepted = manualReviewAccepted;
 artifactInfo.badIntervalsSamples = badIntervals;
 artifactInfo.badIntervalsSeconds = badIntervals / EEG_raw.srate;
+artifactInfo.continuousIntervalsDeleted = continuousIntervalsDeleted;
+artifactInfo.originalReferenceLatencySamples = originalTargetLatency;
 artifactInfo.flatTail = flatTail;
 artifactInfo.detectionSummary = detectionSummary;
 artifactInfo.thresholds = cfg;
 
 EEG_clean.etc.artifactProcessing = artifactInfo;
 EEG_eegContinuous.etc.artifactProcessing = artifactInfo;
+EEG_eogContinuous.etc.artifactProcessing = artifactInfo;
+EEG_emgContinuous.etc.artifactProcessing = artifactInfo;
 
 pop_saveset(EEG_eegContinuous, ...
     'filename', [caseName, '_artifact_clean_continuous.set'], ...
+    'filepath', outputDir);
+pop_saveset(EEG_eogContinuous, ...
+    'filename', [caseName, '_artifact_clean_eog_continuous.set'], ...
+    'filepath', outputDir);
+pop_saveset(EEG_emgContinuous, ...
+    'filename', [caseName, '_artifact_clean_emg_continuous.set'], ...
     'filepath', outputDir);
 
 %% H. 保存伪迹区间和完整日志
@@ -392,12 +394,21 @@ artifactLog.statusIndex = statusIdx;
 artifactLog.knownInterpolatedLabels = knownInterpolatedLabels;
 artifactLog.knownInterpolatedIndices = knownInterpolatedIdx;
 artifactLog.icaChannels = labels(icaEegIdx);
+artifactLog.automaticBadIntervalsSamples = autoBadIntervals;
+artifactLog.manualReviewAccepted = manualReviewAccepted;
 artifactLog.badIntervalsSamples = badIntervals;
 artifactLog.badIntervalsSeconds = badIntervals / EEG_raw.srate;
+artifactLog.continuousIntervalsDeleted = continuousIntervalsDeleted;
+artifactLog.originalReferenceLatencySamples = originalTargetLatency;
 artifactLog.componentsSuggested = suggestedComponents;
 artifactLog.componentsRemoved = removedComponents;
 artifactLog.componentReferenceLabels = referenceLabels;
 artifactLog.componentScores = componentScores;
+artifactLog.componentScoresFile = componentCsv;
+artifactLog.eogContinuousSet = fullfile(outputDir, ...
+    [caseName, '_artifact_clean_eog_continuous.set']);
+artifactLog.emgContinuousSet = fullfile(outputDir, ...
+    [caseName, '_artifact_clean_emg_continuous.set']);
 artifactLog.flatTail = flatTail;
 artifactLog.detectionSummary = detectionSummary;
 artifactLog.config = cfg;
@@ -406,23 +417,27 @@ logFile = fullfile(outputDir, [caseName, '_artifact_log.mat']);
 save(logFile, 'artifactLog', '-v7.3');
 
 %% I. 清洗后才截取最后一个 code 32 epoch
-fprintf('I. 清洗后截取最后一个 code 32 epoch ...\n');
 [EEG_eegContinuous, targetLatency] = keepLatestReferenceEvent( ...
     EEG_eegContinuous, cfg.referenceEvent);
 
-epochContainsContinuousArtifact = true;
+epochContainsContinuousArtifact = false;
 epochArtifactOverlap = zeros(0, 2);
-residualEpochArtifact = true;
+residualEpochArtifact = false;
+
+if ~isempty(originalTargetLatency)
+    originalEpochStart = originalTargetLatency + ...
+        cfg.epochWindow(1) * EEG_raw.srate;
+    originalEpochEnd = originalTargetLatency + ...
+        cfg.epochWindow(2) * EEG_raw.srate;
+    epochArtifactOverlap = intervalsOverlap( ...
+        badIntervals, originalEpochStart, originalEpochEnd);
+    epochContainsContinuousArtifact = ~isempty(epochArtifactOverlap);
+end
 
 if isempty(targetLatency)
     warning('%s：没有找到参考事件 %s，跳过 epoch。', ...
         caseName, cfg.referenceEvent);
 else
-    epochStart = targetLatency + cfg.epochWindow(1) * EEG_raw.srate;
-    epochEnd = targetLatency + cfg.epochWindow(2) * EEG_raw.srate;
-    epochArtifactOverlap = intervalsOverlap(badIntervals, epochStart, epochEnd);
-    epochContainsContinuousArtifact = ~isempty(epochArtifactOverlap);
-
     EEG_epoch = pop_epoch(EEG_eegContinuous, ...
         {cfg.referenceEvent}, cfg.epochWindow, 'epochinfo', 'yes');
     EEG_epoch = eeg_checkset(EEG_epoch);
@@ -446,7 +461,6 @@ else
 
     if cfg.rejectDetectedEpoch && ...
             (epochContainsContinuousArtifact || residualEpochArtifact)
-        fprintf('   目标 epoch 被标记为污染，按配置另存接受版本。\n');
         EEG_epochAccepted = pop_rejepoch(EEG_epoch, 1, 0);
         EEG_epochAccepted.etc.artifactProcessing = ...
             EEG_epoch.etc.artifactProcessing;
@@ -454,10 +468,6 @@ else
             'filename', [caseName, '_artifact_clean_event32_epoch_accepted.set'], ...
             'filepath', outputDir);
         clear EEG_epochAccepted;
-    elseif epochContainsContinuousArtifact || residualEpochArtifact
-        fprintf('   目标 epoch 有污染标记，但按配置保留供学习/复核。\n');
-    else
-        fprintf('   目标 epoch 未触发当前伪迹规则。\n');
     end
 end
 
@@ -470,6 +480,8 @@ epochSummary.containsContinuousArtifact = epochContainsContinuousArtifact;
 epochSummary.continuousArtifactOverlap = epochArtifactOverlap;
 epochSummary.residualEpochArtifact = residualEpochArtifact;
 epochSummary.rejectDetectedEpoch = cfg.rejectDetectedEpoch;
+epochSummary.originalReferenceLatencySamples = originalTargetLatency;
+epochSummary.cleanedDurationSeconds = EEG_eegContinuous.pnts / EEG_eegContinuous.srate;
 epochSummary.intervalCsv = intervalCsv;
 epochSummary.continuousSet = fullfile(outputDir, ...
     [caseName, '_artifact_clean_continuous.set']);
@@ -479,17 +491,75 @@ save(fullfile(outputDir, [caseName, '_epoch_qc.mat']), 'epochSummary');
 
 %% J. 保存前后波形质控图
 figureFile = fullfile(figureDir, [caseName, '_artifact_qc.png']);
-plotArtifactQC(EEG_raw, EEG_eegContinuous, EEG_eogContinuous, ...
-    EEG_emgContinuous, labels, eegIdx, eogIdx, emgIdx, ...
-    targetLatency, cfg.epochWindow, badIntervals, removedComponents, ...
+plotArtifactQC(EEG_raw, EEG_detection, EEG_raw, EEG_raw, ...
+    labels, eegIdx, eogIdx, emgIdx, originalTargetLatency, ...
+    cfg.epochWindow, badIntervals, removedComponents, ...
     figureFile, caseName);
 
-fprintf('J. 质控图：%s\n', figureFile);
-fprintf('连续清洗结果：%s\n', fullfile(outputDir, ...
-    [caseName, '_artifact_clean_continuous.set']));
-fprintf('epoch 结果：%s\n', fullfile(outputDir, ...
-    [caseName, '_artifact_clean_event32_epoch.set']));
+end
 
+
+function [intervals, accepted] = manuallyReviewContinuousArtifacts( ...
+        EEG, displayIdx, automaticIntervals, cfg)
+% 打开 EEGLAB 的连续波形浏览器。用户拖动时间范围进行标记，
+% 点击 ACCEPT AND DELETE 后返回 TMPREJ；关闭/取消则不删除任何时间片段。
+% 这里的时间标记会作用于全部通道，而不只是当前显示的通道。
+
+intervals = zeros(0, 2);
+accepted = false;
+if isempty(displayIdx)
+    return;
+end
+
+displayData = double(EEG.data(displayIdx, :, 1));
+nDisplayChannels = numel(displayIdx);
+winrej = zeros(0, 5 + nDisplayChannels);
+if cfg.showAutomaticIntervalsInReview && ~isempty(automaticIntervals)
+    winrej = [automaticIntervals, ...
+        repmat([1.0 0.75 0.75], size(automaticIntervals, 1), 1), ...
+        true(size(automaticIntervals, 1), nDisplayChannels)];
+end
+
+% eegplot 的按钮回调在 MATLAB base workspace 中执行，因此用一个专用
+% 临时变量接收 TMPREJ，避免依赖函数工作区变量。
+evalin('base', 'clear TWC_MANUAL_TMPREJ');
+oldFigures = findall(0, 'Type', 'figure', 'Tag', 'EEGPLOT');
+
+eegplotArgs = { ...
+    'srate', EEG.srate, ...
+    'winlength', cfg.manualReviewWindowSeconds, ...
+    'title', 'TWC_USA 连续伪迹人工标注（拖动标记，点击 ACCEPT AND DELETE）', ...
+    'events', EEG.event, ...
+    'winrej', winrej, ...
+    'command', 'assignin(''base'', ''TWC_MANUAL_TMPREJ'', TMPREJ);', ...
+    'butlabel', 'ACCEPT AND DELETE'};
+
+if ~isempty(EEG.chanlocs)
+    eegplotArgs = [eegplotArgs, {'eloc_file', EEG.chanlocs(displayIdx)}];
+end
+
+eegplot(displayData, eegplotArgs{:});
+drawnow;
+newFigures = setdiff(findall(0, 'Type', 'figure', 'Tag', 'EEGPLOT'), ...
+    oldFigures);
+if isempty(newFigures)
+    evalin('base', 'clear TWC_MANUAL_TMPREJ');
+    return;
+end
+
+uiwait(newFigures(1));
+hasMarks = evalin('base', ...
+    'exist(''TWC_MANUAL_TMPREJ'', ''var'')');
+if hasMarks
+    marks = evalin('base', 'TWC_MANUAL_TMPREJ');
+    evalin('base', 'clear TWC_MANUAL_TMPREJ TMPREJ');
+    if ~isempty(marks) && size(marks, 2) >= 2
+        intervals = mergeIntervals(marks(:, 1:2), EEG.pnts);
+    end
+    accepted = true;
+else
+    evalin('base', 'clear TWC_MANUAL_TMPREJ TMPREJ');
+end
 end
 
 
@@ -874,8 +944,8 @@ xline(0, 'r--');
 grid on;
 xlabel('相对最后一个 code 32 的时间 (s)');
 ylabel('Cz (uV)');
-title('Cz：原始导入波形 vs ICA 后、EEG 滤波波形');
-legend({'原始','ICA 后'}, 'Location', 'best');
+title('Cz：原始导入波形 vs 0.5-35 Hz 连续观察滤波波形');
+legend({'原始','观察滤波'}, 'Location', 'best');
 
 subplot(4,1,2);
 if isempty(eogPlotIdx)
@@ -922,7 +992,7 @@ xline(0, 'r--');
 yticks([]);
 grid on;
 xlabel('相对时间 (s)');
-title(sprintf('自动标记的连续伪迹区间；移除 IC：%s', ...
+title(sprintf('人工确认的连续伪迹区间；移除 IC：%s', ...
     mat2str(removedComponents)));
 
 sgtitle([caseName, ' | 连续伪迹处理质控']);
