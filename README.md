@@ -150,19 +150,6 @@ TWC_USA/
 └─ resources/                    # MATLAB 项目生成元数据，忽略
 ```
 
-## 本地输出
-
-脚本生成的 inventory、events、特征 CSV、`.set/.fdt`、`.mat`、`.fig`、PNG 和 QC 文件都留在本地。例如：
-
-- `s01`：`results/TWC_USA_inventory_eeglab.csv`
-- `s02`：`results/TWC_USA_events_eeglab.csv`
-- `s03`：case07 的 epoch、EOG/EMG/频谱特征和 summary 图
-- `s04`：连续记录的事件表、通道表和 overview 图
-- `s05`：EEGLAB/MATLAB 绘图比较结果
-- `s06`：伪迹区间、ICA/epoch QC、清理后的本地 EEGLAB 数据和 QC 图
-
-这些文件均不应提交到 GitHub。
-
 ## 当前边界与后续扩展
 
 目前项目聚焦于单个示例案例和基础处理概念，没有组水平统计、机器学习训练、严谨的交叉验证、临床判断或生产级参数管理。脚本中的阈值和频带是学习用途的示例，需要结合数据说明、实验问题和正式方法学重新评估。
