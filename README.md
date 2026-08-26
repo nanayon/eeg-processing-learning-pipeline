@@ -122,7 +122,7 @@ s06_eeglab_artifact_preprocessing;
 - [DREAM database（官方数据记录）](https://bridges.monash.edu/articles/dataset/The_DREAM_database/22133105)
 - [DREAM database 论文](https://doi.org/10.1038/s41467-025-61945-1)
 
-本仓库**不上传原始数据、报告、个人/实验元数据、处理结果或由数据生成的图表**。数据只应保存在本地被 `.gitignore` 排除的目录中。
+本仓库**不上传原始数据、报告、个人/实验元数据、处理结果或由数据生成的图表**。
 
 随数据包提供的 `README.txt` 说明 DREAM 数据通常采用 CC BY 4.0，除非实验说明另有规定；实际使用时必须同时阅读并遵守数据包中的 `README.txt`、`ExperimentalDescription.txt`、官方数据页面及其最新条款。`data/README.md` 只提供获取和放置数据的简要说明，不替代原始协议。
 
